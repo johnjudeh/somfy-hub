@@ -19,19 +19,27 @@
 */
 
 #include <EEPROM.h>
-#define PORT_TX 5 //5 of PORTD = DigitalPin 5
+#define RF_DATA_OUT_PIN 13
+
+#define BTN_UP_PIN 12
+#define BTN_STOP_PIN 14
+#define BTN_DOWN_PIN 27
 
 #define SYMBOL 640
-#define HAUT 0x2
+#define UP 0x2
 #define STOP 0x1
-#define BAS 0x4
+#define DOWN 0x4
 #define PROG 0x8
-#define EEPROM_ADDRESS 0
 
-#define REMOTE 0x121300    //<-- Change it!
+#define EEPROM_ADDR_ROLLING_CODE 0
+#define EEPROM_ADDR_PROGRAMMED 2
+#define EEPROM_TOTAL_MEMORY 3
 
-unsigned int newRollingCode = 101;       //<-- Change it!
-unsigned int rollingCode = 0;
+#define REMOTE 0x121303    //<-- Change it!
+
+uint16_t rollingCode;
+bool programmed;
+
 byte frame[7];
 byte checksum;
 
@@ -41,32 +49,73 @@ void SendCommand(byte *frame, byte sync);
 
 void setup() {
   Serial.begin(115200);
-  DDRD |= 1<<PORT_TX; // Pin 5 an output
-  PORTD &= !(1<<PORT_TX); // Pin 5 LOW
-
-  if (EEPROM.get(EEPROM_ADDRESS, rollingCode) < newRollingCode) {
-    EEPROM.put(EEPROM_ADDRESS, newRollingCode);
+  delay(1000);
+  Serial.println("");
+  
+  pinMode(RF_DATA_OUT_PIN, OUTPUT);
+  digitalWrite(RF_DATA_OUT_PIN, LOW);
+  
+  pinMode(BTN_UP_PIN, INPUT);
+  digitalWrite(BTN_UP_PIN, LOW);
+  
+  pinMode(BTN_STOP_PIN, INPUT);
+  digitalWrite(BTN_STOP_PIN, LOW);
+  
+  pinMode(BTN_DOWN_PIN, INPUT);
+  digitalWrite(BTN_DOWN_PIN, LOW);
+  
+  if (EEPROM.begin(EEPROM_TOTAL_MEMORY)) {
+    Serial.println("EEPROM initialised");
   }
+
+  // Fetch non-volatile values from EEPROM
+  EEPROM.get(EEPROM_ADDR_ROLLING_CODE, rollingCode);
+  if (EEPROM.read(EEPROM_ADDR_PROGRAMMED) == 0xFF) {
+    programmed = false;
+  } else {
+    EEPROM.get(EEPROM_ADDR_PROGRAMMED, programmed);
+  }
+  Serial.print("Initial rolling code    : "); Serial.println(rollingCode);
+  Serial.print("Programmed              : "); Serial.println(programmed);
+
+  if (!programmed) {
+    Serial.println("Resetting rolling code to 0");
+    rollingCode = 0;
+    EEPROM.put(EEPROM_ADDR_ROLLING_CODE, rollingCode);
+    EEPROM.commit();
+  }
+  
   Serial.print("Simulated remote number : "); Serial.println(REMOTE, HEX);
   Serial.print("Current rolling code    : "); Serial.println(rollingCode);
 }
 
 void loop() {
+  byte btnUp = digitalRead(BTN_UP_PIN);
+  byte btnStop = digitalRead(BTN_STOP_PIN);
+  byte btnDown = digitalRead(BTN_DOWN_PIN);
+
+  bool btnActivated = btnUp == HIGH || btnStop == HIGH || btnDown == HIGH;
+  
+  char serie = '\0';
+  
   if (Serial.available() > 0) {
-    char serie = (char)Serial.read();
+    serie = (char)Serial.read();
     Serial.println("");
-//    Serial.print("Remote : "); Serial.println(REMOTE, HEX);
-    if(serie == 'm'||serie == 'u'||serie == 'h') {
+    Serial.print("serie = "); Serial.println(serie);
+  }
+
+  if (serie != '\0' || btnActivated) {
+    if(serie == 'm'||serie == 'u'||serie == 'h' || btnUp == HIGH) {
       Serial.println("Monte"); // Somfy is a French company, after all.
-      BuildFrame(frame, HAUT);
+      BuildFrame(frame, UP);
     }
-    else if(serie == 's') {
+    else if(serie == 's' || btnStop == HIGH) {
       Serial.println("Stop");
       BuildFrame(frame, STOP);
     }
-    else if(serie == 'b'||serie == 'd') {
+    else if(serie == 'b'||serie == 'd' || btnDown == HIGH) {
       Serial.println("Descend");
-      BuildFrame(frame, BAS);
+      BuildFrame(frame, DOWN);
     }
     else if(serie == 'p') {
       Serial.println("Prog");
@@ -76,26 +125,30 @@ void loop() {
       Serial.println("Custom code");
       BuildFrame(frame, serie);
     }
-
+  
     Serial.println("");
     SendCommand(frame, 2);
     for(int i = 0; i<2; i++) {
       SendCommand(frame, 7);
+    }
+  
+    if(serie == 'p' and !programmed) {
+      programmed = true;
+      EEPROM.put(EEPROM_ADDR_PROGRAMMED, programmed);
+      EEPROM.commit();
     }
   }
 }
 
 
 void BuildFrame(byte *frame, byte button) {
-  unsigned int code;
-  EEPROM.get(EEPROM_ADDRESS, code);
-  frame[0] = 0xA7; // Encryption key. Doesn't matter much
-  frame[1] = button << 4;  // Which button did  you press? The 4 LSB will be the checksum
-  frame[2] = code >> 8;    // Rolling code (big endian)
-  frame[3] = code;         // Rolling code
-  frame[4] = REMOTE >> 16; // Remote address
-  frame[5] = REMOTE >>  8; // Remote address
-  frame[6] = REMOTE;       // Remote address
+  frame[0] = 0xA7;             // Encryption key. Doesn't matter much
+  frame[1] = button << 4;      // Which button did  you press? The 4 LSB will be the checksum
+  frame[2] = rollingCode >> 8; // Rolling code (big endian)
+  frame[3] = rollingCode;      // Rolling code
+  frame[4] = REMOTE >> 16;     // Remote address
+  frame[5] = REMOTE >>  8;     // Remote address
+  frame[6] = REMOTE;           // Remote address
 
   Serial.print("Frame         : ");
   for(byte i = 0; i < 7; i++) {
@@ -139,52 +192,58 @@ void BuildFrame(byte *frame, byte button) {
     Serial.print(frame[i],HEX); Serial.print(" ");
   }
   Serial.println("");
-  Serial.print("Rolling Code  : "); Serial.println(code);
-  EEPROM.put(EEPROM_ADDRESS, code + 1); //  We store the value of the rolling code in the
-                                        // EEPROM. It should take up to 2 adresses but the
-                                        // Arduino function takes care of it.
+  Serial.print("Rolling Code  : "); Serial.println(rollingCode);
+  
+  //  We store the value of the rolling code in the
+  // EEPROM. It should take up to 2 adresses but the
+  // Arduino function takes care of it.
+  rollingCode += 1;
+  EEPROM.put(EEPROM_ADDR_ROLLING_CODE, rollingCode);
+  EEPROM.commit();
 }
+
+
 
 void SendCommand(byte *frame, byte sync) {
   if(sync == 2) { // Only with the first frame.
   //Wake-up pulse & Silence
-    PORTD |= 1<<PORT_TX;
+    digitalWrite(RF_DATA_OUT_PIN, HIGH);
     delayMicroseconds(9415);
-    PORTD &= !(1<<PORT_TX);
+    digitalWrite(RF_DATA_OUT_PIN, LOW);
     delayMicroseconds(89565);
   }
 
 // Hardware sync: two sync for the first frame, seven for the following ones.
   for (int i = 0; i < sync; i++) {
-    PORTD |= 1<<PORT_TX;
+    digitalWrite(RF_DATA_OUT_PIN, HIGH);
     delayMicroseconds(4*SYMBOL);
-    PORTD &= !(1<<PORT_TX);
+    digitalWrite(RF_DATA_OUT_PIN, LOW);
     delayMicroseconds(4*SYMBOL);
   }
 
 // Software sync
-  PORTD |= 1<<PORT_TX;
+  digitalWrite(RF_DATA_OUT_PIN, HIGH);
   delayMicroseconds(4550);
-  PORTD &= !(1<<PORT_TX);
+  digitalWrite(RF_DATA_OUT_PIN, LOW);
   delayMicroseconds(SYMBOL);
   
   
 //Data: bits are sent one by one, starting with the MSB.
   for(byte i = 0; i < 56; i++) {
     if(((frame[i/8] >> (7 - (i%8))) & 1) == 1) {
-      PORTD &= !(1<<PORT_TX);
+      digitalWrite(RF_DATA_OUT_PIN, LOW);
       delayMicroseconds(SYMBOL);
-      PORTD ^= 1<<5;
+      digitalWrite(RF_DATA_OUT_PIN, HIGH);
       delayMicroseconds(SYMBOL);
     }
     else {
-      PORTD |= (1<<PORT_TX);
+      digitalWrite(RF_DATA_OUT_PIN, HIGH);
       delayMicroseconds(SYMBOL);
-      PORTD ^= 1<<5;
+      digitalWrite(RF_DATA_OUT_PIN, LOW);
       delayMicroseconds(SYMBOL);
     }
   }
   
-  PORTD &= !(1<<PORT_TX);
+  digitalWrite(RF_DATA_OUT_PIN, LOW);
   delayMicroseconds(30415); // Inter-frame silence
 }
