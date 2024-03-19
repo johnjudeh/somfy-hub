@@ -19,11 +19,20 @@
 */
 
 #include <EEPROM.h>
+
+// User config - update me
 #define RF_DATA_OUT_PIN 13
 
 #define BTN_UP_PIN 12
 #define BTN_STOP_PIN 14
 #define BTN_DOWN_PIN 27
+#define BTN_CYCLE_PIN 26
+#define BTN_PROG_PIN 25
+
+#define REMOTE_ID_START 0x121303
+
+const int REMOTE_COUNT = 5;
+// End of config
 
 #define SYMBOL 640
 #define UP 0x2
@@ -31,21 +40,32 @@
 #define DOWN 0x4
 #define PROG 0x8
 
-#define EEPROM_ADDR_ROLLING_CODE 0
-#define EEPROM_ADDR_PROGRAMMED 2
-#define EEPROM_TOTAL_MEMORY 3
+#define EEPROM_BLANK_VAL 0xFF
+#define EEPROM_START_ADDR 0
 
-#define REMOTE 0x121303    //<-- Change it!
+struct Remote {
+  bool programmed;
+  uint32_t id;
+  uint16_t rollingCode;
+} typedef Remote;
 
-uint16_t rollingCode;
-bool programmed;
+struct Hub {
+  bool initialised;
+  int remote_index;
+  Remote remotes[REMOTE_COUNT];
+} typedef Hub;
+
+Hub somfy_hub;
 
 byte frame[7];
-byte checksum;
+bool btn_was_active = false;
 
-void BuildFrame(byte* frame, byte button);
-void SendCommand(byte* frame, byte sync);
-
+void init_hub(Hub* hub);
+void print_hub(Hub hub);
+void init_eeprom(Hub* hub);
+void program_remote(Hub* hub);
+void build_frame(byte* frame, Hub* hub, byte command);
+void send_command(byte* frame, byte sync);
 
 void setup() {
   Serial.begin(115200);
@@ -56,100 +76,136 @@ void setup() {
   digitalWrite(RF_DATA_OUT_PIN, LOW);
 
   pinMode(BTN_UP_PIN, INPUT);
-  digitalWrite(BTN_UP_PIN, LOW);
-
   pinMode(BTN_STOP_PIN, INPUT);
-  digitalWrite(BTN_STOP_PIN, LOW);
-
   pinMode(BTN_DOWN_PIN, INPUT);
-  digitalWrite(BTN_DOWN_PIN, LOW);
+  pinMode(BTN_CYCLE_PIN, INPUT);
+  pinMode(BTN_PROG_PIN, INPUT);
 
-  if (EEPROM.begin(EEPROM_TOTAL_MEMORY)) {
-    Serial.println("EEPROM initialised");
-  }
-
-  // Fetch non-volatile values from EEPROM
-  EEPROM.get(EEPROM_ADDR_ROLLING_CODE, rollingCode);
-  if (EEPROM.read(EEPROM_ADDR_PROGRAMMED) == 0xFF) {
-    programmed = false;
-  }
-  else {
-    EEPROM.get(EEPROM_ADDR_PROGRAMMED, programmed);
-  }
-  Serial.print("Initial rolling code    : "); Serial.println(rollingCode);
-  Serial.print("Programmed              : "); Serial.println(programmed);
-
-  if (!programmed) {
-    Serial.println("Resetting rolling code to 0");
-    rollingCode = 0;
-    EEPROM.put(EEPROM_ADDR_ROLLING_CODE, rollingCode);
-    EEPROM.commit();
-  }
-
-  Serial.print("Simulated remote number : "); Serial.println(REMOTE, HEX);
-  Serial.print("Current rolling code    : "); Serial.println(rollingCode);
+  init_eeprom(&somfy_hub);
 }
 
 void loop() {
-  byte btnUp = digitalRead(BTN_UP_PIN);
-  byte btnStop = digitalRead(BTN_STOP_PIN);
-  byte btnDown = digitalRead(BTN_DOWN_PIN);
+  byte btn_up = digitalRead(BTN_UP_PIN);
+  byte btn_stop = digitalRead(BTN_STOP_PIN);
+  byte btn_down = digitalRead(BTN_DOWN_PIN);
+  byte btn_cycle = digitalRead(BTN_CYCLE_PIN);
+  byte btn_prog = digitalRead(BTN_PROG_PIN);
 
-  bool btnActivated = btnUp == HIGH || btnStop == HIGH || btnDown == HIGH;
+  bool btn_is_active = btn_up == HIGH || btn_stop == HIGH || btn_down == HIGH || btn_cycle == HIGH || btn_prog == HIGH;
 
-  char serie = '\0';
+  char serial_cmd = '\0';
 
   if (Serial.available() > 0) {
-    serie = (char)Serial.read();
+    serial_cmd = (char)Serial.read();
     Serial.println("");
-    Serial.print("serie = "); Serial.println(serie);
+    Serial.print("serie = "); Serial.println(serial_cmd);
   }
 
-  if (serie != '\0' || btnActivated) {
-    if (serie == 'm' || serie == 'u' || serie == 'h' || btnUp == HIGH) {
+  if (serial_cmd != '\0' || btn_is_active) {
+    if (serial_cmd == 'm' || serial_cmd == 'u' || serial_cmd == 'h' || btn_up == HIGH) {
       Serial.println("Monte"); // Somfy is a French company, after all.
-      BuildFrame(frame, UP);
+      build_frame(frame, &somfy_hub, UP);
     }
-    else if (serie == 's' || btnStop == HIGH) {
+    else if (serial_cmd == 's' || btn_stop == HIGH) {
       Serial.println("Stop");
-      BuildFrame(frame, STOP);
+      build_frame(frame, &somfy_hub, STOP);
     }
-    else if (serie == 'b' || serie == 'd' || btnDown == HIGH) {
+    else if (serial_cmd == 'b' || serial_cmd == 'd' || btn_down == HIGH) {
       Serial.println("Descend");
-      BuildFrame(frame, DOWN);
+      build_frame(frame, &somfy_hub, DOWN);
     }
-    else if (serie == 'p') {
+    else if (serial_cmd == 'p' || btn_prog == HIGH) {
       Serial.println("Prog");
-      BuildFrame(frame, PROG);
+      build_frame(frame, &somfy_hub, PROG);
+    }
+    else if (btn_cycle) {
+      somfy_hub.remote_index = (somfy_hub.remote_index + 1) % REMOTE_COUNT;
+      Serial.printf("Remote index = %d\n", somfy_hub.remote_index);
+      EEPROM.put(EEPROM_START_ADDR, somfy_hub);
+      EEPROM.commit();
     }
     else {
       Serial.println("Custom code");
-      BuildFrame(frame, serie);
+      build_frame(frame, &somfy_hub, serial_cmd);
     }
 
     Serial.println("");
-    SendCommand(frame, 2);
+    if (!btn_was_active) {
+      // The first frame is sent differently to the rest
+      send_command(frame, 2);
+    }
     for (int i = 0; i < 2; i++) {
-      SendCommand(frame, 7);
+      send_command(frame, 7);
     }
 
-    if (serie == 'p' and !programmed) {
-      programmed = true;
-      EEPROM.put(EEPROM_ADDR_PROGRAMMED, programmed);
-      EEPROM.commit();
+    if (serial_cmd == 'p') {
+      program_remote(&somfy_hub);
     }
+  }
+
+  // We set this so the next loop can check
+  btn_was_active = btn_is_active;
+}
+
+void init_hub(Hub* hub) {
+  EEPROM.get(EEPROM_START_ADDR, *hub);
+
+  if (EEPROM.read(EEPROM_START_ADDR) == EEPROM_BLANK_VAL) {
+    Serial.println("Initialising hub from blank EEPROM");
+    for (int i = 0; i < REMOTE_COUNT; i++) {
+      Remote* premote = &hub->remotes[i];
+      premote->id = REMOTE_ID_START + i;
+      premote->rollingCode = 0;
+      premote->programmed = false;
+    }
+    hub->initialised = true;
+    hub->remote_index = 0;
+    EEPROM.put(EEPROM_START_ADDR, *hub);
+    EEPROM.commit();
   }
 }
 
+void print_hub(Hub hub) {
+  Serial.printf("initialised = %s\n", hub.initialised ? "true" : "false");
+  Serial.printf("remote_index = %d\n", hub.remote_index);
+  Serial.println("remotes");
+  for (int i = 0; i < REMOTE_COUNT; i++) {
+    Remote remote = hub.remotes[i];
+    Serial.printf("|__remote %d:", i + 1);
+    Serial.printf("   id: %x; rollingCode: %d; programmed: %d\n", remote.id, remote.rollingCode, remote.programmed);
+  }
+  Serial.println("");
+}
 
-void BuildFrame(byte* frame, byte button) {
-  frame[0] = 0xA7;             // Encryption key. Doesn't matter much
-  frame[1] = button << 4;      // Which button did  you press? The 4 LSB will be the checksum
-  frame[2] = rollingCode >> 8; // Rolling code (big endian)
-  frame[3] = rollingCode;      // Rolling code
-  frame[4] = REMOTE >> 16;     // Remote address
-  frame[5] = REMOTE >> 8;     // Remote address
-  frame[6] = REMOTE;           // Remote address
+void init_eeprom(Hub* hub) {
+  if (EEPROM.begin(sizeof(somfy_hub))) {
+    Serial.println("EEPROM initialised");
+    init_hub(&somfy_hub);
+    print_hub(somfy_hub);
+  }
+}
+
+void program_remote(Hub* hub) {
+  Remote* premote = &hub->remotes[hub->remote_index];
+  if (premote->programmed) {
+    return;
+  }
+  // Ideally send signal here
+  premote->programmed = true;
+  EEPROM.put(EEPROM_START_ADDR, *hub);
+  EEPROM.commit();
+}
+
+void build_frame(byte* frame, Hub* hub, byte command) {
+  Remote* premote = &hub->remotes[hub->remote_index];
+
+  frame[0] = 0xA7;                      // Encryption key. Doesn't matter much
+  frame[1] = command << 4;              // Which button did  you press? The 4 LSB will be the checksum
+  frame[2] = premote->rollingCode >> 8; // Rolling code (big endian)
+  frame[3] = premote->rollingCode;      // Rolling code
+  frame[4] = premote->id >> 16;         // Remote address
+  frame[5] = premote->id >> 8;          // Remote address
+  frame[6] = premote->id;               // Remote address
 
   Serial.print("Frame         : ");
   for (byte i = 0; i < 7; i++) {
@@ -160,7 +216,7 @@ void BuildFrame(byte* frame, byte button) {
   }
 
   // Checksum calculation: a XOR of all the nibbles
-  checksum = 0;
+  byte checksum = 0;
   for (byte i = 0; i < 7; i++) {
     checksum = checksum ^ frame[i] ^ (frame[i] >> 4);
   }
@@ -179,7 +235,6 @@ void BuildFrame(byte* frame, byte button) {
     Serial.print(frame[i], HEX); Serial.print(" ");
   }
 
-
   // Obfuscation: a XOR of all the bytes
   for (byte i = 1; i < 7; i++) {
     frame[i] ^= frame[i - 1];
@@ -193,19 +248,14 @@ void BuildFrame(byte* frame, byte button) {
     Serial.print(frame[i], HEX); Serial.print(" ");
   }
   Serial.println("");
-  Serial.print("Rolling Code  : "); Serial.println(rollingCode);
+  Serial.print("Rolling Code  : "); Serial.println(premote->rollingCode);
 
-  //  We store the value of the rolling code in the
-  // EEPROM. It should take up to 2 adresses but the
-  // Arduino function takes care of it.
-  rollingCode += 1;
-  EEPROM.put(EEPROM_ADDR_ROLLING_CODE, rollingCode);
+  premote->rollingCode += 1;
+  EEPROM.put(EEPROM_START_ADDR, *hub);
   EEPROM.commit();
 }
 
-
-
-void SendCommand(byte* frame, byte sync) {
+void send_command(byte* frame, byte sync) {
   if (sync == 2) { // Only with the first frame.
     //Wake-up pulse & Silence
     digitalWrite(RF_DATA_OUT_PIN, HIGH);
