@@ -1,0 +1,9 @@
+EEPROM initialised
+initialised = true
+remote_index = 0
+remotes
+|__remote 1:   id: 121303; rollingCode: 185; programmed: 1
+|__remote 2:   id: 121304; rollingCode: 14; programmed: 0
+|__remote 3:   id: 121305; rollingCode: 0; programmed: 0
+|__remote 4:   id: 121306; rollingCode: 0; programmed: 0
+|__remote 5:   id: 121307; rollingCode: 0; programmed: 0

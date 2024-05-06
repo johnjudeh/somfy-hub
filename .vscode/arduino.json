@@ -1,7 +1,7 @@
 {
     "configuration": "PartitionScheme=default,FlashFreq=80,UploadSpeed=115200,DebugLevel=none,EraseFlash=none",
     "board": "esp32:esp32:node32s",
-    "port": "/dev/tty.usbserial-1460",
+    "port": "/dev/tty.usbserial-1410",
     "programmer": "esptool",
     "sketch": "somfy-hub.ino",
     "output": "../build"

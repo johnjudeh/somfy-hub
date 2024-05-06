@@ -19,29 +19,38 @@
 */
 
 #include <EEPROM.h>
+#include <HomeSpan.h>
 
 // User config - update me
 #define RF_DATA_OUT_PIN 13
 
 #define BTN_UP_PIN 12
-#define BTN_STOP_PIN 14
+#define BTN_MY_OR_STOP_PIN 14
 #define BTN_DOWN_PIN 27
 #define BTN_CYCLE_PIN 26
 #define BTN_PROG_PIN 25
 
 #define REMOTE_ID_START 0x121303
+#define DEFAULT_REMOTE_INDEX -1
 
 const int REMOTE_COUNT = 5;
 // End of config
 
 #define SYMBOL 640
 #define UP 0x2
-#define STOP 0x1
+#define MY_OR_STOP 0x1
 #define DOWN 0x4
 #define PROG 0x8
 
 #define EEPROM_BLANK_VAL 0xFF
 #define EEPROM_START_ADDR 0
+
+class AppleHome {
+public:
+  void setup();
+};
+
+AppleHome appleHome;
 
 struct Remote {
   bool programmed;
@@ -57,15 +66,13 @@ struct Hub {
 
 Hub somfy_hub;
 
-byte frame[7];
-bool btn_was_active = false;
-
 void init_hub(Hub* hub);
 void print_hub(Hub hub);
 void init_eeprom(Hub* hub);
 void program_remote(Hub* hub);
-void build_frame(byte* frame, Hub* hub, byte command);
-void send_command(byte* frame, byte sync);
+void build_frame(byte* frame, Hub* hub, byte command, int remote_index = DEFAULT_REMOTE_INDEX);
+void send_frame(byte* frame, byte sync);
+void send_command(byte command, bool long_press = false, int remote_index = DEFAULT_REMOTE_INDEX);
 
 void setup() {
   Serial.begin(115200);
@@ -76,22 +83,23 @@ void setup() {
   digitalWrite(RF_DATA_OUT_PIN, LOW);
 
   pinMode(BTN_UP_PIN, INPUT);
-  pinMode(BTN_STOP_PIN, INPUT);
+  pinMode(BTN_MY_OR_STOP_PIN, INPUT);
   pinMode(BTN_DOWN_PIN, INPUT);
   pinMode(BTN_CYCLE_PIN, INPUT);
   pinMode(BTN_PROG_PIN, INPUT);
 
   init_eeprom(&somfy_hub);
+  appleHome.setup();
 }
 
 void loop() {
   byte btn_up = digitalRead(BTN_UP_PIN);
-  byte btn_stop = digitalRead(BTN_STOP_PIN);
+  byte btn_my_or_stop = digitalRead(BTN_MY_OR_STOP_PIN);
   byte btn_down = digitalRead(BTN_DOWN_PIN);
   byte btn_cycle = digitalRead(BTN_CYCLE_PIN);
   byte btn_prog = digitalRead(BTN_PROG_PIN);
 
-  bool btn_is_active = btn_up == HIGH || btn_stop == HIGH || btn_down == HIGH || btn_cycle == HIGH || btn_prog == HIGH;
+  bool btn_is_active = btn_up == HIGH || btn_my_or_stop == HIGH || btn_down == HIGH || btn_cycle == HIGH || btn_prog == HIGH;
 
   char serial_cmd = '\0';
 
@@ -104,19 +112,19 @@ void loop() {
   if (serial_cmd != '\0' || btn_is_active) {
     if (serial_cmd == 'm' || serial_cmd == 'u' || serial_cmd == 'h' || btn_up == HIGH) {
       Serial.println("Monte"); // Somfy is a French company, after all.
-      build_frame(frame, &somfy_hub, UP);
+      send_command(UP);
     }
-    else if (serial_cmd == 's' || btn_stop == HIGH) {
-      Serial.println("Stop");
-      build_frame(frame, &somfy_hub, STOP);
+    else if (serial_cmd == 's' || btn_my_or_stop == HIGH) {
+      Serial.println("MY_OR_STOP");
+      send_command(MY_OR_STOP);
     }
     else if (serial_cmd == 'b' || serial_cmd == 'd' || btn_down == HIGH) {
       Serial.println("Descend");
-      build_frame(frame, &somfy_hub, DOWN);
+      send_command(DOWN);
     }
     else if (serial_cmd == 'p' || btn_prog == HIGH) {
       Serial.println("Prog");
-      build_frame(frame, &somfy_hub, PROG);
+      program_remote(&somfy_hub);
     }
     else if (btn_cycle) {
       somfy_hub.remote_index = (somfy_hub.remote_index + 1) % REMOTE_COUNT;
@@ -126,25 +134,10 @@ void loop() {
     }
     else {
       Serial.println("Custom code");
-      build_frame(frame, &somfy_hub, serial_cmd);
+      send_command(serial_cmd);
     }
-
-    Serial.println("");
-    if (!btn_was_active) {
-      // The first frame is sent differently to the rest
-      send_command(frame, 2);
-    }
-    for (int i = 0; i < 2; i++) {
-      send_command(frame, 7);
-    }
-
-    if (serial_cmd == 'p') {
-      program_remote(&somfy_hub);
-    }
+    delay(500);
   }
-
-  // We set this so the next loop can check
-  btn_was_active = btn_is_active;
 }
 
 void init_hub(Hub* hub) {
@@ -165,6 +158,10 @@ void init_hub(Hub* hub) {
   }
 }
 
+void print_remote(Remote remote) {
+  Serial.printf("   id: %x; rollingCode: %d; programmed: %d\n", remote.id, remote.rollingCode, remote.programmed);
+}
+
 void print_hub(Hub hub) {
   Serial.printf("initialised = %s\n", hub.initialised ? "true" : "false");
   Serial.printf("remote_index = %d\n", hub.remote_index);
@@ -172,7 +169,7 @@ void print_hub(Hub hub) {
   for (int i = 0; i < REMOTE_COUNT; i++) {
     Remote remote = hub.remotes[i];
     Serial.printf("|__remote %d:", i + 1);
-    Serial.printf("   id: %x; rollingCode: %d; programmed: %d\n", remote.id, remote.rollingCode, remote.programmed);
+    print_remote(remote);
   }
   Serial.println("");
 }
@@ -190,14 +187,21 @@ void program_remote(Hub* hub) {
   if (premote->programmed) {
     return;
   }
-  // Ideally send signal here
+  send_command(PROG);
   premote->programmed = true;
   EEPROM.put(EEPROM_START_ADDR, *hub);
   EEPROM.commit();
 }
 
-void build_frame(byte* frame, Hub* hub, byte command) {
-  Remote* premote = &hub->remotes[hub->remote_index];
+void build_frame(byte* frame, Hub* hub, byte command, int remote_index /* = DEFAULT_REMOTE_INDEX */) {
+  Remote* premote;
+
+  if (remote_index == DEFAULT_REMOTE_INDEX) {
+    premote = &hub->remotes[hub->remote_index];
+  }
+  else {
+    premote = &hub->remotes[remote_index];
+  }
 
   frame[0] = 0xA7;                      // Encryption key. Doesn't matter much
   frame[1] = command << 4;              // Which button did  you press? The 4 LSB will be the checksum
@@ -255,7 +259,7 @@ void build_frame(byte* frame, Hub* hub, byte command) {
   EEPROM.commit();
 }
 
-void send_command(byte* frame, byte sync) {
+void send_frame(byte* frame, byte sync) {
   if (sync == 2) { // Only with the first frame.
     //Wake-up pulse & Silence
     digitalWrite(RF_DATA_OUT_PIN, HIGH);
@@ -297,4 +301,61 @@ void send_command(byte* frame, byte sync) {
 
   digitalWrite(RF_DATA_OUT_PIN, LOW);
   delayMicroseconds(30415); // Inter-frame silence
+}
+
+void send_command(byte command, bool long_press /* = false */, int remote_index /* = DEFAULT_REMOTE_INDEX */) {
+  byte frame[7];
+  int frame_repeat = long_press ? 20 : 2;
+
+  build_frame(frame, &somfy_hub, command, remote_index);
+
+  // The first frame is sent differently to the rest
+  send_frame(frame, 2);
+
+  for (int i = 0; i < frame_repeat; i++) {
+    send_frame(frame, 7); // Takes about ~100 ms
+  }
+}
+
+struct SomfyBlind : Service::WindowCovering {
+
+  int remote_index;
+  SpanCharacteristic* targetPosition;
+  SpanCharacteristic* currentPosition;
+
+  SomfyBlind(int remote_index) : Service::WindowCovering() {
+    this->remote_index = remote_index;
+    this->targetPosition = (new Characteristic::TargetPosition())->setRange(0, 100, 50);
+    this->currentPosition = (new Characteristic::CurrentPosition())->setRange(0, 100, 50);
+  }
+
+  bool update() {
+    uint8_t new_target = this->targetPosition->getNewVal();
+    if (new_target >= 75) {
+      send_command(UP, false, this->remote_index);
+      this->currentPosition->setVal(100);
+    }
+    else if (new_target < 25) {
+      send_command(DOWN, false, this->remote_index);
+      this->currentPosition->setVal(0);
+    }
+    else {
+      send_command(MY_OR_STOP, false, this->remote_index);
+      this->currentPosition->setVal(50);
+    }
+    return true;
+  }
+};
+
+void AppleHome::setup() {
+  homeSpan.begin(Category::WindowCoverings, "Somfy Blinds");
+
+  new SpanAccessory();
+  new Service::AccessoryInformation();
+  new Characteristic::Identify();
+  for (int i = 0; i < REMOTE_COUNT; i++) {
+    new SomfyBlind(i);
+  }
+
+  homeSpan.autoPoll();
 }
